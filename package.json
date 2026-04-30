@@ -18,14 +18,14 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/carderne/pi-sandbox.git"
+    "url": "git+https://github.com/cad0p/pi-sandbox.git"
   },
   "author": "Chris Arderne <chris@rdrn.me>",
   "license": "MIT",
   "bugs": {
-    "url": "https://github.com/carderne/pi-sandbox/issues"
+    "url": "https://github.com/cad0p/pi-sandbox/issues"
   },
-  "homepage": "https://github.com/carderne/pi-sandbox",
+  "homepage": "https://github.com/cad0p/pi-sandbox",
   "scripts": {
     "fmt": "oxfmt index.ts",
     "lint": "oxlint index.ts",
@@ -35,7 +35,7 @@
     "ci:check": "npm run check"
   },
   "dependencies": {
-    "@carderne/sandbox-runtime": "^0.0.43"
+    "@carderne/sandbox-runtime": "github:cad0p/sandbox-runtime#main"
   },
   "peerDependencies": {
     "@mariozechner/pi-coding-agent": "^0.61.0"
