@@ -60,21 +60,45 @@
  * Linux also requires: bubblewrap, socat, ripgrep
  */
 
+import type {
+  AgentToolResult,
+  ExtensionAPI,
+  ExtensionContext,
+} from "@mariozechner/pi-coding-agent";
+
 import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { SandboxManager, type SandboxRuntimeConfig } from "@carderne/sandbox-runtime";
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+
+import {
+  SandboxManager,
+  type SandboxAskCallback,
+  type SandboxRuntimeConfig,
+} from "@carderne/sandbox-runtime";
 import {
   type BashOperations,
   createBashTool,
+  createLocalBashOperations,
   getAgentDir,
   isToolCallEventType,
 } from "@mariozechner/pi-coding-agent";
+import { matchesKey, Key, truncateToWidth } from "@mariozechner/pi-tui";
 
 interface SandboxConfig extends SandboxRuntimeConfig {
   enabled?: boolean;
+  /**
+   * Commands that always run unsandboxed (e.g. ["gh auth token"]).
+   * Matched by exact full command string. Persists via config file.
+   * Override via "unsandboxedCommands" key in sandbox.json.
+   * Global and project configs are merged additively (set union).
+   */
+  unsandboxedCommands?: string[];
+  /**
+   * Patterns that trigger the reactive bypass prompt when found in
+   * sandboxed command output. Case-insensitive substring match.
+   */
+  sandboxFailurePatterns?: string[];
 }
 
 const DEFAULT_CONFIG: SandboxConfig = {
@@ -98,9 +122,84 @@ const DEFAULT_CONFIG: SandboxConfig = {
     denyRead: ["/Users", "/home"],
     allowRead: [".", "~/.config", "~/.local", "Library"],
     allowWrite: [".", "/tmp"],
-    denyWrite: [".env", ".env.*", "*.pem", "*.key"],
+    denyWrite: [".env", ".env.*", "*.pem", "*.key", ".pi/sandbox.json", "~/.pi/agent/sandbox.json"],
   },
 };
+
+const AUDIT_LOG = join(homedir(), ".pi", "agent", "sandbox", "audit.log");
+function auditLog(entry: {
+  timestamp: string;
+  command: string;
+  type: "predictive" | "reactive";
+  choice:
+    | "once"
+    | "session"
+    | "project"
+    | "global"
+    | "project-config"
+    | "global-config"
+    | "declined";
+  unsandboxed: boolean;
+}): void {
+  try {
+    mkdirSync(dirname(AUDIT_LOG), { recursive: true });
+    const line = `${JSON.stringify(entry)}\n`;
+    writeFileSync(AUDIT_LOG, line, { flag: "a" });
+  } catch {
+    /* ignore */
+  }
+}
+
+/**
+ * Determine the config level for an unsandboxed command.
+ * Returns "project-config", "global-config", or "session" based on which config
+ * contains the command. "-config" suffix means no user interaction occurred.
+ */
+function getUnsandboxedCommandLevel(
+  command: string,
+  cwd: string,
+  sessionCommands: string[],
+): "project-config" | "global-config" | "session" {
+  const normalized = normalizeCmd(command);
+
+  if (sessionCommands.includes(normalized)) return "session";
+
+  // Check project config (normalize on read to handle manual edits)
+  const projectConfigPath = join(cwd, ".pi", "sandbox.json");
+  if (existsSync(projectConfigPath)) {
+    try {
+      const projectConfig = JSON.parse(readFileSync(projectConfigPath, "utf-8"));
+      if (
+        (projectConfig.unsandboxedCommands as string[] | undefined)
+          ?.map(normalizeCmd)
+          .includes(normalized)
+      ) {
+        return "project-config";
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+
+  // Check global config (normalize on read to handle manual edits)
+  const globalConfigPath = join(getAgentDir(), "sandbox.json");
+  if (existsSync(globalConfigPath)) {
+    try {
+      const globalConfig = JSON.parse(readFileSync(globalConfigPath, "utf-8"));
+      if (
+        (globalConfig.unsandboxedCommands as string[] | undefined)
+          ?.map(normalizeCmd)
+          .includes(normalized)
+      ) {
+        return "global-config";
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+
+  return "project-config";
+}
 
 function loadConfig(cwd: string): SandboxConfig {
   const projectConfigPath = join(cwd, ".pi", "sandbox.json");
@@ -159,11 +258,30 @@ function deepMerge(base: SandboxConfig, overrides: Partial<SandboxConfig>): Sand
   if (extOverrides.allowBrowserProcess !== undefined) {
     extResult.allowBrowserProcess = extOverrides.allowBrowserProcess;
   }
+  if (overrides.unsandboxedCommands !== undefined) {
+    const baseSet = new Set(result.unsandboxedCommands ?? []);
+    for (const cmd of overrides.unsandboxedCommands) baseSet.add(cmd);
+    result.unsandboxedCommands = [...baseSet];
+  }
+  if (overrides.sandboxFailurePatterns !== undefined) {
+    const baseSet = new Set(result.sandboxFailurePatterns ?? []);
+    for (const pat of overrides.sandboxFailurePatterns) baseSet.add(pat);
+    result.sandboxFailurePatterns = [...baseSet];
+  }
 
   return result;
 }
 
 // ── Domain helpers ────────────────────────────────────────────────────────────
+
+export function shouldPromptForWrite(
+  path: string,
+  allowWrite: string[],
+  matchesPattern: (path: string, patterns: string[]) => boolean,
+): boolean {
+  // Secure default: empty allowWrite means deny-all writes (prompt every path).
+  return allowWrite.length === 0 || !matchesPattern(path, allowWrite);
+}
 
 function extractDomainsFromCommand(command: string): string[] {
   const urlRegex = /https?:\/\/([a-zA-Z0-9][a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/g;
@@ -176,6 +294,7 @@ function extractDomainsFromCommand(command: string): string[] {
 }
 
 function domainMatchesPattern(domain: string, pattern: string): boolean {
+  if (pattern === "*") return true;
   if (pattern.startsWith("*.")) {
     const base = pattern.slice(2);
     return domain === base || domain.endsWith("." + base);
@@ -183,19 +302,94 @@ function domainMatchesPattern(domain: string, pattern: string): boolean {
   return domain === pattern;
 }
 
+function allowsAllDomains(allowedDomains: string[] | undefined): boolean {
+  return allowedDomains?.includes("*") ?? false;
+}
+
 function domainIsAllowed(domain: string, allowedDomains: string[]): boolean {
   return allowedDomains.some((p) => domainMatchesPattern(domain, p));
+}
+
+function createNetworkAskCallback(allowedDomains: string[]): SandboxAskCallback {
+  return async ({ host }) => domainIsAllowed(host, allowedDomains);
+}
+
+// ── Sandbox failure detection ───────────────────────────────────────────────
+
+/**
+ * Default patterns that indicate a sandbox/auth/keychain failure.
+ * Override via "sandboxFailurePatterns" key in sandbox.json.
+ */
+const DEFAULT_FAILURE_PATTERNS: string[] = [
+  "operation not permitted",
+  "no oauth token",
+  "authentication failed",
+  "user interaction is not allowed",
+  "errsecinteractionnotallowed",
+  "terminal prompts disabled",
+  "could not read username",
+  "permission denied",
+  "requires authentication",
+];
+
+/**
+ * Check if a command starts with any of the unsandboxed patterns.
+ */
+function commandIsUnsandboxed(command: string, patterns: string[]): boolean {
+  const normalized = normalizeCmd(command);
+  return patterns.some((p) => normalized === p);
+}
+
+/**
+ * Detect if a command failed due to OS sandbox restrictions.
+ * This is reactive: we run sandboxed first, then check the output.
+ */
+function isSandboxFailure(output: string, patterns: string[]): boolean {
+  const lower = output.toLowerCase();
+  return patterns.some((p) => lower.includes(p.toLowerCase()));
 }
 
 // ── Output analysis ───────────────────────────────────────────────────────────
 
 /** Extract a path from a bash "Operation not permitted" OS sandbox error. */
 function extractBlockedWritePath(output: string): string | null {
-  const match = output.match(/(?:\/bin\/bash|bash|sh): (\/[^\s:]+): Operation not permitted/);
+  const match = output.match(
+    /(?:\/bin\/bash|bash|sh): (?:line \d: )?(\/[^:]+): Operation not permitted/,
+  );
   return match ? match[1] : null;
 }
 
 // ── Path pattern matching ─────────────────────────────────────────────────────
+
+// ── Action label helper ───────────────────────────────────────────────────────
+
+/** Convert an Action enum to a human-readable label. */
+function actionLabel(
+  action:
+    | "abort"
+    | "session"
+    | "project"
+    | "global"
+    | "once"
+    | "project-config"
+    | "global-config"
+    | "declined",
+): string {
+  return action === "once"
+    ? "once"
+    : action === "session"
+      ? "session"
+      : action === "project"
+        ? "project"
+        : "global";
+}
+
+// ── Command normalization ─────────────────────────────────────────────────────
+
+/** Normalize a command for consistent comparison. Trims, collapses whitespace. */
+function normalizeCmd(cmd: string): string {
+  return cmd.trim().split(/\s+/).join(" ");
+}
 
 function matchesPattern(filePath: string, patterns: string[]): boolean {
   const expanded = filePath.replace(/^~/, homedir());
@@ -207,7 +401,8 @@ function matchesPattern(filePath: string, patterns: string[]): boolean {
       const escaped = absP.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*");
       return new RegExp(`^${escaped}$`).test(abs);
     }
-    return abs === absP || abs.startsWith(absP + "/");
+    const sep = absP.endsWith("/") ? "" : "/";
+    return abs === absP || abs.startsWith(absP + sep);
   });
 }
 
@@ -232,9 +427,16 @@ function readOrEmptyConfig(configPath: string): Partial<SandboxConfig> {
   }
 }
 
-function writeConfigFile(configPath: string, config: Partial<SandboxConfig>): void {
-  mkdirSync(dirname(configPath), { recursive: true });
-  writeFileSync(configPath, JSON.stringify(config, null, 2) + "\n", "utf-8");
+/** Returns true on success, false if the file could not be written. */
+function writeConfigFile(configPath: string, config: Partial<SandboxConfig>): boolean {
+  try {
+    mkdirSync(dirname(configPath), { recursive: true });
+    writeFileSync(configPath, JSON.stringify(config, null, 2) + "\n", "utf-8");
+    return true;
+  } catch (e) {
+    console.error(`Failed to write config ${configPath}: ${e}`);
+    return false;
+  }
 }
 
 function addDomainToConfig(configPath: string, domain: string): void {
@@ -279,6 +481,16 @@ function addWritePathToConfig(configPath: string, pathToAdd: string): void {
   }
 }
 
+function addUnsandboxedCommandToConfig(configPath: string, command: string): void {
+  const config = readOrEmptyConfig(configPath);
+  const existing = config.unsandboxedCommands ?? [];
+  const normalized = normalizeCmd(command);
+  if (normalized && !existing.includes(normalized)) {
+    config.unsandboxedCommands = [...existing, normalized];
+    writeConfigFile(configPath, config);
+  }
+}
+
 // ── Sandboxed bash ops ────────────────────────────────────────────────────────
 
 function createSandboxedBashOps(): BashOperations {
@@ -293,7 +505,7 @@ function createSandboxedBashOps(): BashOperations {
       return new Promise((resolve, reject) => {
         const child = spawn("bash", ["-c", wrappedCommand], {
           cwd,
-          env,
+          env: { ...env },
           detached: true,
           stdio: ["ignore", "pipe", "pipe"],
         });
@@ -389,6 +601,14 @@ export default function (pi: ExtensionAPI) {
     return [...(config.filesystem?.allowWrite ?? []), ...sessionAllowedWritePaths];
   }
 
+  // Session-only unsandboxed command patterns — JS memory only, agent cannot access.
+  const sessionUnsandboxedCommands: string[] = [];
+
+  function getEffectiveUnsandboxedCommands(cwd: string): string[] {
+    const config = loadConfig(cwd);
+    return [...(config.unsandboxedCommands ?? []).map(normalizeCmd), ...sessionUnsandboxedCommands];
+  }
+
   // ── Sandbox reinitialize ────────────────────────────────────────────────────
   // Called after granting a session/permanent allowance so the OS-level sandbox
   // picks up the new rules before the next bash subprocess starts.
@@ -398,23 +618,27 @@ export default function (pi: ExtensionAPI) {
     const config = loadConfig(cwd);
     const configExt = config as unknown as { allowBrowserProcess?: boolean };
     try {
+      const network = {
+        ...config.network,
+        allowedDomains: [...(config.network?.allowedDomains ?? []), ...sessionAllowedDomains],
+        deniedDomains: config.network?.deniedDomains ?? [],
+      };
       await SandboxManager.reset();
-      await SandboxManager.initialize({
-        network: {
-          ...config.network,
-          allowedDomains: [...(config.network?.allowedDomains ?? []), ...sessionAllowedDomains],
-          deniedDomains: config.network?.deniedDomains ?? [],
+      await SandboxManager.initialize(
+        {
+          network,
+          filesystem: {
+            ...config.filesystem,
+            denyRead: config.filesystem?.denyRead ?? [],
+            allowRead: [...(config.filesystem?.allowRead ?? []), ...sessionAllowedReadPaths],
+            allowWrite: [...(config.filesystem?.allowWrite ?? []), ...sessionAllowedWritePaths],
+            denyWrite: config.filesystem?.denyWrite ?? [],
+          },
+          allowBrowserProcess: configExt.allowBrowserProcess,
+          enableWeakerNetworkIsolation: true,
         },
-        filesystem: {
-          ...config.filesystem,
-          denyRead: config.filesystem?.denyRead ?? [],
-          allowRead: config.filesystem?.allowRead ?? [],
-          allowWrite: [...(config.filesystem?.allowWrite ?? []), ...sessionAllowedWritePaths],
-          denyWrite: config.filesystem?.denyWrite ?? [],
-        },
-        allowBrowserProcess: configExt.allowBrowserProcess,
-        enableWeakerNetworkIsolation: true,
-      });
+        createNetworkAskCallback(network.allowedDomains),
+      );
     } catch (e) {
       console.error(`Warning: Failed to reinitialize sandbox: ${e}`);
     }
@@ -422,127 +646,521 @@ export default function (pi: ExtensionAPI) {
 
   // ── UI prompts ──────────────────────────────────────────────────────────────
 
-  async function promptDomainBlock(
+  type Action =
+    | "abort"
+    | "session"
+    | "project"
+    | "global"
+    | "once"
+    | "project-config"
+    | "global-config";
+
+  // ── Record decision + notify user + agent ───────────────────────────────────
+
+  function recordDecisionAndNotify(
     ctx: ExtensionContext,
-    domain: string,
-  ): Promise<"abort" | "session" | "project" | "global"> {
-    if (!ctx.hasUI) return "abort";
-    const choice = await ctx.ui.select(`🌐 Network blocked: "${domain}" is not in allowedDomains`, [
-      "Abort (keep blocked)",
-      "Allow for this session only",
-      "Allow for this project  →  .pi/sandbox.json",
-      "Allow for all projects  →  ~/.pi/agent/sandbox.json",
-    ]);
-    if (!choice || choice.startsWith("Abort")) return "abort";
-    if (choice.startsWith("Allow for this session")) return "session";
-    if (choice.startsWith("Allow for this project")) return "project";
-    return "global";
+    decision: {
+      action:
+        | "bypass-predictive"
+        | "bypass-retry"
+        | "bypass-declined"
+        | "domain-allowed"
+        | "read-allowed"
+        | "write-allowed"
+        | "domain-denied"
+        | "read-denied"
+        | "write-denied";
+      target: string;
+      choice: string;
+    },
+  ): void {
+    const { action, target, choice } = decision;
+
+    const auditType: "predictive" | "reactive" =
+      action === "bypass-predictive" ? "predictive" : "reactive";
+    const unsandboxed = action === "bypass-predictive" || action === "bypass-retry";
+
+    auditLog({
+      timestamp: new Date().toISOString(),
+      command: target,
+      type: auditType,
+      choice: choice as any,
+      unsandboxed,
+    });
+
+    let notifyMsg: string;
+    let sendMsg: string;
+    let level: "info" | "warning" = "info";
+
+    switch (action) {
+      case "bypass-predictive":
+        notifyMsg = `🔓 Sandbox disabled: "${target}" (${choice})`;
+        sendMsg = `User pre-configured unsandboxed execution of exact command "${target}" (${choice})`;
+        level = "warning";
+        break;
+      case "bypass-retry":
+        notifyMsg = `🔓 Retried without sandbox: "${target}" (exact match, ${choice})`;
+        sendMsg = `User retried "${target}" without sandbox (exact match, ${choice})`;
+        break;
+      case "bypass-declined":
+        notifyMsg = `🛡️  Kept sandboxed: "${target}"`;
+        sendMsg = `User declined unsandboxed retry of "${target}"`;
+        break;
+      case "domain-allowed":
+        notifyMsg = `🌐 Domain "${target}" allowed (${choice})`;
+        sendMsg = `User allowed domain "${target}" (${choice})`;
+        break;
+      case "read-allowed":
+        notifyMsg = `📖 Read path "${target}" allowed (${choice})`;
+        sendMsg = `User allowed read path "${target}" (${choice})`;
+        break;
+      case "write-allowed":
+        notifyMsg = `📝 Write path "${target}" allowed (${choice})`;
+        sendMsg = `User allowed write path "${target}" (${choice})`;
+        break;
+      case "domain-denied":
+        notifyMsg = `🚫 Domain "${target}" denied`;
+        sendMsg = `User denied network access to "${target}"`;
+        level = "warning";
+        break;
+      case "read-denied":
+        notifyMsg = `🚫 Read path "${target}" denied`;
+        sendMsg = `User denied read access to "${target}"`;
+        break;
+      case "write-denied":
+        notifyMsg = `🚫 Write path "${target}" denied`;
+        sendMsg = `User denied write access to "${target}"`;
+        break;
+    }
+
+    ctx.ui.notify(notifyMsg, level);
+    pi.sendMessage(
+      { customType: "sandbox-decision", content: sendMsg, display: false },
+      { deliverAs: "steer", triggerTurn: false },
+    );
   }
 
-  async function promptReadBlock(
-    ctx: ExtensionContext,
-    filePath: string,
-  ): Promise<"abort" | "session" | "project" | "global"> {
-    if (!ctx.hasUI) return "abort";
-    const choice = await ctx.ui.select(`📖 Read blocked: "${filePath}" is not in allowRead`, [
-      "Abort (keep blocked)",
-      "Allow for this session only",
-      "Allow for this project  →  .pi/sandbox.json",
-      "Allow for all projects  →  ~/.pi/agent/sandbox.json",
-    ]);
-    if (!choice || choice.startsWith("Abort")) return "abort";
-    if (choice.startsWith("Allow for this session")) return "session";
-    if (choice.startsWith("Allow for this project")) return "project";
-    return "global";
+  interface PromptOption {
+    label: string;
+    key: string;
+    action: Action;
+    confirm?: boolean;
+    hint?: string;
   }
 
-  async function promptWriteBlock(
+  interface PromptLabels {
+    once: string;
+    session: string;
+    project: string;
+    global: string;
+    abort: string;
+  }
+
+  function buildPromptOptions(labels: PromptLabels): PromptOption[] {
+    return [
+      { label: labels.once, key: "o", action: "once" },
+      { label: labels.session, key: "s", action: "session" },
+      {
+        label: labels.project,
+        key: "P",
+        action: "project",
+        confirm: true,
+        hint: "→ .pi/sandbox.json",
+      },
+      {
+        label: labels.global,
+        key: "G",
+        action: "global",
+        confirm: true,
+        hint: "→ ~/.pi/agent/sandbox.json",
+      },
+      { label: labels.abort, key: "esc", action: "abort" },
+    ];
+  }
+
+  const PERMISSION_OPTIONS = buildPromptOptions({
+    once: "Allow once",
+    session: "Allow for this session only",
+    project: "Allow for this project",
+    global: "Allow for all projects",
+    abort: "Abort (keep blocked)",
+  });
+
+  const BYPASS_OPTIONS = buildPromptOptions({
+    once: "Retry without sandbox (once)",
+    session: "Retry without sandbox in this session",
+    project: "Retry without sandbox for this project",
+    global: "Retry without sandbox for all projects",
+    abort: "Abort (keep failed result)",
+  });
+
+  /** True if the key event is a navigation key (arrows, enter, escape). */
+  function isNavigationKey(data: string): boolean {
+    return (
+      matchesKey(data, Key.enter) ||
+      matchesKey(data, Key.escape) ||
+      matchesKey(data, Key.ctrl("c")) ||
+      matchesKey(data, Key.up) ||
+      matchesKey(data, Key.down)
+    );
+  }
+
+  async function showPermissionPrompt(
     ctx: ExtensionContext,
-    filePath: string,
-  ): Promise<"abort" | "session" | "project" | "global"> {
+    title: string,
+    options: PromptOption[],
+  ): Promise<Action> {
     if (!ctx.hasUI) return "abort";
-    const choice = await ctx.ui.select(`📝 Write blocked: "${filePath}" is not in allowWrite`, [
-      "Abort (keep blocked)",
-      "Allow for this session only",
-      "Allow for this project  →  .pi/sandbox.json",
-      "Allow for all projects  →  ~/.pi/agent/sandbox.json",
-    ]);
-    if (!choice || choice.startsWith("Abort")) return "abort";
-    if (choice.startsWith("Allow for this session")) return "session";
-    if (choice.startsWith("Allow for this project")) return "project";
-    return "global";
+
+    const result = await ctx.ui.custom<Action>((tui, theme, _kb, done) => {
+      let selectedIndex = 0;
+      let pendingAction: Action | null = null;
+      let renderedAt = 0;
+      const DEBOUNCE_MS = 400;
+
+      function resolve(action: Action) {
+        done(action);
+      }
+
+      return {
+        render(width: number): string[] {
+          if (renderedAt === 0) renderedAt = Date.now();
+          const lines: string[] = [];
+          lines.push(truncateToWidth(theme.fg("warning", title), width));
+          lines.push("");
+
+          for (let i = 0; i < options.length; i++) {
+            const opt = options[i];
+            const isSelected = i === selectedIndex;
+            const isPending = pendingAction === opt.action;
+
+            const prefix = isSelected ? " → " : "   ";
+            const keyHint = theme.fg("accent", `[${opt.key}]`);
+            let label = opt.label;
+
+            if (opt.hint) {
+              label += `  ${theme.fg("dim", opt.hint)}`;
+            }
+
+            if (isPending) {
+              label += `  ${theme.fg("warning", "→ press Enter to confirm")}`;
+            }
+
+            const line = `${prefix}${keyHint} ${label}`;
+            lines.push(truncateToWidth(line, width));
+          }
+
+          lines.push("");
+          const hasEsc = options.some((o) => o.key === "esc");
+          const abortKeys = hasEsc ? "esc/ctrl+c" : "q/ctrl+c";
+          const footer = pendingAction
+            ? `↑↓ navigate  enter confirm  ${abortKeys.split("/")[0]} abort`
+            : `↑↓ navigate  enter select  ${abortKeys} abort`;
+          lines.push(truncateToWidth(theme.fg("dim", footer), width));
+
+          return lines;
+        },
+
+        handleInput(data: string): void {
+          // NOTE: pi routes ALL keyboard input to this component when focused.
+          // App-level keys like Ctrl+O (expand) are NOT processed. Workaround:
+          // esc to dismiss, expand tool output, then re-trigger the prompt.
+
+          // Debounce: ignore single-key presses for DEBOUNCE_MS after prompt appears.
+          // Prevents accidental selection when user is typing in chat text box.
+          // Navigation keys (arrows, enter, escape) are always allowed.
+          if (Date.now() - renderedAt < DEBOUNCE_MS && !isNavigationKey(data)) {
+            return;
+          }
+
+          if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c"))) {
+            resolve("abort");
+            return;
+          }
+
+          if (matchesKey(data, Key.enter)) {
+            if (pendingAction) {
+              resolve(pendingAction);
+            } else {
+              resolve(options[selectedIndex]?.action ?? "abort");
+            }
+            return;
+          }
+
+          if (matchesKey(data, Key.up)) {
+            selectedIndex = Math.max(0, selectedIndex - 1);
+            pendingAction = null;
+            tui.requestRender();
+            return;
+          }
+          if (matchesKey(data, Key.down)) {
+            selectedIndex = Math.min(options.length - 1, selectedIndex + 1);
+            pendingAction = null;
+            tui.requestRender();
+            return;
+          }
+
+          for (let i = 0; i < options.length; i++) {
+            const opt = options[i];
+            if (data === opt.key) {
+              // Exact case match → immediate
+              resolve(opt.action);
+              return;
+            }
+            if (data.toLowerCase() === opt.key.toLowerCase()) {
+              // Lowercase match → confirmation required for P/A
+              if (opt.confirm) {
+                pendingAction = opt.action;
+                selectedIndex = i;
+              } else {
+                resolve(opt.action);
+              }
+              tui.requestRender();
+              return;
+            }
+          }
+        },
+
+        invalidate(): void {
+          // no-op
+        },
+      };
+    });
+
+    return result ?? "abort";
+  }
+
+  async function promptDomainBlock(ctx: ExtensionContext, domain: string): Promise<Action> {
+    return showPermissionPrompt(
+      ctx,
+      `🌐 Network blocked: "${domain}" is not in allowedDomains`,
+      PERMISSION_OPTIONS,
+    ) as Promise<Action>;
+  }
+
+  async function promptReadBlock(ctx: ExtensionContext, filePath: string): Promise<Action> {
+    return showPermissionPrompt(
+      ctx,
+      `📖 Read blocked: "${filePath}" is not in allowRead`,
+      PERMISSION_OPTIONS,
+    ) as Promise<Action>;
+  }
+
+  async function promptWriteBlock(ctx: ExtensionContext, filePath: string): Promise<Action> {
+    return showPermissionPrompt(
+      ctx,
+      `📝 Write blocked: "${filePath}" is not in allowWrite`,
+      PERMISSION_OPTIONS,
+    ) as Promise<Action>;
+  }
+
+  async function promptBypassBlock(
+    ctx: ExtensionContext,
+    command: string,
+    errorOutput: string,
+  ): Promise<Action> {
+    const fullCmd = command.trimStart();
+    const shortCmd = fullCmd.split(/\s+/).slice(0, 3).join(" ");
+    const title =
+      `🔓 Sandbox blocked "${shortCmd}${fullCmd.length > shortCmd.length ? "…" : ""}"\n` +
+      `Error: ${truncateToWidth(errorOutput, 120)}\n` +
+      `Retry unsandboxed?`;
+    return showPermissionPrompt(ctx, title, BYPASS_OPTIONS) as Promise<Action>;
+  }
+
+  function warnIfAllDomainsAllowed(ctx: ExtensionContext, config: SandboxConfig): void {
+    if (!allowsAllDomains(config.network?.allowedDomains)) return;
+    ctx.ui.notify(
+      '⚠️ Network sandbox allows all domains because network.allowedDomains contains "*". ' +
+        'Only use this intentionally; remove "*" to restore per-domain prompts.',
+      "warning",
+    );
   }
 
   // ── Apply allowance choices ─────────────────────────────────────────────────
 
-  async function applyDomainChoice(
-    choice: "session" | "project" | "global",
-    domain: string,
-    cwd: string,
-  ): Promise<void> {
+  async function applyDomainChoice(choice: Action, domain: string, cwd: string): Promise<void> {
     const { globalPath, projectPath } = getConfigPaths(cwd);
-    if (!sessionAllowedDomains.includes(domain)) sessionAllowedDomains.push(domain);
+    if (choice === "session") sessionAllowedDomains.push(domain);
     if (choice === "project") addDomainToConfig(projectPath, domain);
     if (choice === "global") addDomainToConfig(globalPath, domain);
+    if (choice === "once") {
+      sessionAllowedDomains.push(domain);
+      try {
+        await reinitializeSandbox(cwd);
+      } finally {
+        sessionAllowedDomains.pop();
+      }
+      return;
+    }
     await reinitializeSandbox(cwd);
   }
 
-  async function applyReadChoice(
-    choice: "session" | "project" | "global",
-    filePath: string,
-    cwd: string,
-  ): Promise<void> {
+  async function applyReadChoice(choice: Action, filePath: string, cwd: string): Promise<void> {
     const { globalPath, projectPath } = getConfigPaths(cwd);
-    if (!sessionAllowedReadPaths.includes(filePath)) sessionAllowedReadPaths.push(filePath);
+    if (choice === "session") sessionAllowedReadPaths.push(filePath);
     if (choice === "project") addReadPathToConfig(projectPath, filePath);
     if (choice === "global") addReadPathToConfig(globalPath, filePath);
+    if (choice === "once") {
+      sessionAllowedReadPaths.push(filePath);
+      try {
+        await reinitializeSandbox(cwd);
+      } finally {
+        sessionAllowedReadPaths.pop();
+      }
+      return;
+    }
     await reinitializeSandbox(cwd);
   }
 
-  async function applyWriteChoice(
-    choice: "session" | "project" | "global",
-    filePath: string,
-    cwd: string,
-  ): Promise<void> {
+  async function applyWriteChoice(choice: Action, filePath: string, cwd: string): Promise<void> {
     const { globalPath, projectPath } = getConfigPaths(cwd);
-    if (!sessionAllowedWritePaths.includes(filePath)) sessionAllowedWritePaths.push(filePath);
+    if (choice === "session") sessionAllowedWritePaths.push(filePath);
     if (choice === "project") addWritePathToConfig(projectPath, filePath);
     if (choice === "global") addWritePathToConfig(globalPath, filePath);
+    if (choice === "once") {
+      sessionAllowedWritePaths.push(filePath);
+      try {
+        await reinitializeSandbox(cwd);
+      } finally {
+        sessionAllowedWritePaths.pop();
+      }
+      return;
+    }
     await reinitializeSandbox(cwd);
   }
 
-  // ── Bash tool — with write-block detection and retry ───────────────────────
+  /** Truncate a command string for display, keeping maxLen chars. */
+  function truncateCmd(cmd: string, maxLen = 80): string {
+    const trimmed = cmd.trimStart();
+    if (trimmed.length <= maxLen) return trimmed;
+    return trimmed.slice(0, maxLen) + "…";
+  }
+
+  /**
+   * Extract a concise error snippet from command output for the bypass prompt.
+   */
+  function extractErrorSnippet(output: string, maxLen = 80): string {
+    const firstLine = output.split(/\r?\n/)[0]?.trim() ?? "";
+    if (firstLine.length <= maxLen) return firstLine;
+    return firstLine.slice(0, maxLen) + "…";
+  }
+
+  // ── Bash tool — reactive bypass, write-block detection and retry ───────────
 
   pi.registerTool({
     ...localBash,
     label: "bash (sandboxed)",
     async execute(id, params, signal, onUpdate, ctx) {
-      const runBash = () => {
-        if (!sandboxEnabled || !sandboxInitialized) {
-          return localBash.execute(id, params, signal, onUpdate);
-        }
+      const command = (params as { command?: string }).command ?? "";
+
+      const runSandboxed = () => {
         const sandboxedBash = createBashTool(localCwd, {
           operations: createSandboxedBashOps(),
         });
         return sandboxedBash.execute(id, params, signal, onUpdate);
       };
 
-      const result = await runBash();
+      const runUnsandboxed = () => localBash.execute(id, params, signal, onUpdate);
 
-      // Post-execution: detect OS-level write block and offer to allow.
-      if (sandboxEnabled && sandboxInitialized && ctx?.hasUI) {
+      // Check user-configured unsandboxed patterns first
+      const unsandboxedPatterns = getEffectiveUnsandboxedCommands(ctx.cwd);
+      let wasSandboxed = false;
+      let result: AgentToolResult<any>;
+      if (
+        sandboxEnabled &&
+        sandboxInitialized &&
+        commandIsUnsandboxed(command, unsandboxedPatterns)
+      ) {
+        const displayCmd = truncateCmd(command);
+        const level = getUnsandboxedCommandLevel(command, ctx.cwd, sessionUnsandboxedCommands);
+        recordDecisionAndNotify(ctx, {
+          action: "bypass-predictive",
+          target: displayCmd,
+          choice: level,
+        });
+        result = await runUnsandboxed();
+      } else if (!sandboxEnabled || !sandboxInitialized) {
+        result = await runUnsandboxed();
+      } else {
+        wasSandboxed = true;
+        try {
+          result = await runSandboxed();
+        } catch (e) {
+          if (!(e instanceof Error)) throw e;
+          result = {
+            content: [
+              {
+                type: "text",
+                text: `Error: Command failed: ${e.message}`,
+              },
+            ],
+            details: { exitCode: 1 },
+          };
+        }
+      }
+
+      // Check for sandbox failure and offer bypass (only if we actually sandboxed)
+      if (wasSandboxed && sandboxEnabled && sandboxInitialized && ctx?.hasUI) {
         const outputText = result.content
           .filter((c: any) => c.type === "text")
           .map((c: any) => c.text)
           .join("\n");
+        const exitCode = (result.details as any)?.exitCode ?? 0;
+        let bypassAccepted = false;
+        const failurePatterns =
+          loadConfig(ctx.cwd).sandboxFailurePatterns ?? DEFAULT_FAILURE_PATTERNS;
+        if (isSandboxFailure(outputText, failurePatterns) && exitCode !== 0) {
+          const choice = await promptBypassBlock(ctx, command, extractErrorSnippet(outputText));
 
+          if (choice === "abort") {
+            const displayCmd = truncateCmd(command);
+            recordDecisionAndNotify(ctx, {
+              action: "bypass-declined",
+              target: displayCmd,
+              choice: "declined",
+            });
+          } else {
+            const displayCmd = truncateCmd(command);
+            const normalized = normalizeCmd(command);
+
+            if (choice === "session") {
+              if (normalized && !sessionUnsandboxedCommands.includes(normalized)) {
+                sessionUnsandboxedCommands.push(normalized);
+              }
+            } else if (choice === "project") {
+              addUnsandboxedCommandToConfig(getConfigPaths(ctx.cwd).projectPath, command);
+            } else if (choice === "global") {
+              addUnsandboxedCommandToConfig(getConfigPaths(ctx.cwd).globalPath, command);
+            }
+
+            const bypassLabel = actionLabel(choice);
+
+            recordDecisionAndNotify(ctx, {
+              action: "bypass-retry",
+              target: displayCmd,
+              choice: bypassLabel,
+            });
+
+            result = await runUnsandboxed();
+            bypassAccepted = true;
+          }
+        }
+
+        // Also check for OS-level write block (separate from sandbox failure)
+        // Skip if bypass was accepted — the unsandboxed retry already handled the write.
         const blockedPath = extractBlockedWritePath(outputText);
-        if (blockedPath) {
+        if (blockedPath && !bypassAccepted) {
           const choice = await promptWriteBlock(ctx, blockedPath);
           if (choice !== "abort") {
             await applyWriteChoice(choice, blockedPath, ctx.cwd);
+            const level = actionLabel(choice);
+            recordDecisionAndNotify(ctx, {
+              action: "write-allowed",
+              target: blockedPath,
+              choice: level,
+            });
 
-            // Check if denyWrite would still block it even after allowing.
             const config = loadConfig(ctx.cwd);
             const { projectPath, globalPath } = getConfigPaths(ctx.cwd);
             if (matchesPattern(blockedPath, config.filesystem?.denyWrite ?? [])) {
@@ -563,7 +1181,7 @@ export default function (pi: ExtensionAPI) {
               ],
               details: {},
             });
-            return runBash();
+            result = await runSandboxed();
           }
         }
       }
@@ -572,18 +1190,23 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  // ── user_bash — network pre-check ──────────────────────────────────────────
+  // ── user_bash — network pre-check + reactive bypass ───────────────────────
 
   pi.on("user_bash", async (event, ctx) => {
     if (!sandboxEnabled || !sandboxInitialized) return;
 
+    // Network pre-check
     const domains = extractDomainsFromCommand(event.command);
     const effectiveDomains = getEffectiveAllowedDomains(ctx.cwd);
-
     for (const domain of domains) {
       if (!domainIsAllowed(domain, effectiveDomains)) {
         const choice = await promptDomainBlock(ctx, domain);
         if (choice === "abort") {
+          recordDecisionAndNotify(ctx, {
+            action: "domain-denied",
+            target: domain,
+            choice: "abort",
+          });
           return {
             result: {
               output: `Blocked: "${domain}" is not in allowedDomains. Use /sandbox to review your config.`,
@@ -594,10 +1217,108 @@ export default function (pi: ExtensionAPI) {
           };
         }
         await applyDomainChoice(choice, domain, ctx.cwd);
+        const level = actionLabel(choice);
+        recordDecisionAndNotify(ctx, {
+          action: "domain-allowed",
+          target: domain,
+          choice: level,
+        });
       }
     }
 
-    return { operations: createSandboxedBashOps() };
+    // Predictive bypass: user-configured unsandboxed commands
+    const unsandboxedPatterns = getEffectiveUnsandboxedCommands(ctx.cwd);
+    if (commandIsUnsandboxed(event.command, unsandboxedPatterns)) {
+      const displayCmd = truncateCmd(event.command);
+      const level = getUnsandboxedCommandLevel(event.command, ctx.cwd, sessionUnsandboxedCommands);
+      recordDecisionAndNotify(ctx, {
+        action: "bypass-predictive",
+        target: displayCmd,
+        choice: level,
+      });
+      return; // Let default (unsandboxed) bash run
+    }
+
+    // Reactive bypass: run sandboxed first, prompt on failure
+    if (!ctx.hasUI) {
+      return { operations: createSandboxedBashOps() };
+    }
+
+    const sandboxedOps = createSandboxedBashOps();
+    let output = "";
+    let exitCode = 0;
+    let wasSandboxed = true;
+    try {
+      const execResult = await sandboxedOps.exec(event.command, event.cwd, {
+        onData: (chunk) => {
+          output += chunk;
+        },
+      });
+      exitCode = execResult.exitCode ?? 1;
+    } catch (e) {
+      output = e instanceof Error ? e.message : String(e);
+      exitCode = 1;
+    }
+
+    const failurePatterns = loadConfig(ctx.cwd).sandboxFailurePatterns ?? DEFAULT_FAILURE_PATTERNS;
+    if (wasSandboxed && exitCode !== 0 && isSandboxFailure(output, failurePatterns)) {
+      const choice = await promptBypassBlock(ctx, event.command, extractErrorSnippet(output));
+
+      if (choice === "abort") {
+        const displayCmd = truncateCmd(event.command);
+        recordDecisionAndNotify(ctx, {
+          action: "bypass-declined",
+          target: displayCmd,
+          choice: "declined",
+        });
+      } else {
+        const normalized = normalizeCmd(event.command);
+        if (
+          choice === "session" &&
+          normalized &&
+          !sessionUnsandboxedCommands.includes(normalized)
+        ) {
+          sessionUnsandboxedCommands.push(normalized);
+        } else if (choice === "project") {
+          addUnsandboxedCommandToConfig(getConfigPaths(ctx.cwd).projectPath, event.command);
+        } else if (choice === "global") {
+          addUnsandboxedCommandToConfig(getConfigPaths(ctx.cwd).globalPath, event.command);
+        }
+
+        const bypassLabel = actionLabel(choice);
+        const displayCmd = truncateCmd(event.command);
+
+        recordDecisionAndNotify(ctx, {
+          action: "bypass-retry",
+          target: displayCmd,
+          choice: bypassLabel,
+        });
+
+        // Rerun unsandboxed
+        const localOps = createLocalBashOperations();
+        output = "";
+        try {
+          const execResult = await localOps.exec(event.command, event.cwd, {
+            onData: (chunk) => {
+              output += chunk;
+            },
+          });
+          exitCode = execResult.exitCode ?? 1;
+        } catch (e) {
+          output = e instanceof Error ? e.message : String(e);
+          exitCode = 1;
+        }
+      }
+    }
+
+    return {
+      result: {
+        output,
+        exitCode,
+        cancelled: false,
+        truncated: false,
+      },
+    };
   });
 
   // ── tool_call — network pre-check for bash, path policy for read/write/edit
@@ -618,12 +1339,23 @@ export default function (pi: ExtensionAPI) {
         if (!domainIsAllowed(domain, effectiveDomains)) {
           const choice = await promptDomainBlock(ctx, domain);
           if (choice === "abort") {
+            recordDecisionAndNotify(ctx, {
+              action: "domain-denied",
+              target: domain,
+              choice: "abort",
+            });
             return {
               block: true,
               reason: `Network access to "${domain}" is blocked (not in allowedDomains).`,
             };
           }
           await applyDomainChoice(choice, domain, ctx.cwd);
+          const level = actionLabel(choice);
+          recordDecisionAndNotify(ctx, {
+            action: "domain-allowed",
+            target: domain,
+            choice: level,
+          });
         }
       }
     }
@@ -641,12 +1373,23 @@ export default function (pi: ExtensionAPI) {
       if (!matchesPattern(filePath, effectiveAllowRead)) {
         const choice = await promptReadBlock(ctx, filePath);
         if (choice === "abort") {
+          recordDecisionAndNotify(ctx, {
+            action: "read-denied",
+            target: filePath,
+            choice: "abort",
+          });
           return {
             block: true,
             reason: `Sandbox: read access denied for "${filePath}"`,
           };
         }
         await applyReadChoice(choice, filePath, ctx.cwd);
+        const level = actionLabel(choice);
+        recordDecisionAndNotify(ctx, {
+          action: "read-allowed",
+          target: filePath,
+          choice: level,
+        });
         // Allowed — fall through, tool runs.
         return;
       }
@@ -658,15 +1401,26 @@ export default function (pi: ExtensionAPI) {
       const allowWrite = getEffectiveAllowWrite(ctx.cwd);
       const denyWrite = config.filesystem?.denyWrite ?? [];
 
-      if (allowWrite.length > 0 && !matchesPattern(path, allowWrite)) {
+      if (shouldPromptForWrite(path, allowWrite, matchesPattern)) {
         const choice = await promptWriteBlock(ctx, path);
         if (choice === "abort") {
+          recordDecisionAndNotify(ctx, {
+            action: "write-denied",
+            target: path,
+            choice: "abort",
+          });
           return {
             block: true,
             reason: `Sandbox: write access denied for "${path}" (not in allowWrite)`,
           };
         }
         await applyWriteChoice(choice, path, ctx.cwd);
+        const level = actionLabel(choice);
+        recordDecisionAndNotify(ctx, {
+          action: "write-allowed",
+          target: path,
+          choice: level,
+        });
 
         // denyWrite takes precedence — warn if it would still block.
         if (matchesPattern(path, denyWrite)) {
@@ -696,9 +1450,70 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  // ── session_start ───────────────────────────────────────────────────────────
+  // ── session persistence ─────────────────────────────────────────────────────
+
+  async function restoreSessionState(ctx: ExtensionContext): Promise<void> {
+    try {
+      for (const entry of ctx.sessionManager.getEntries()) {
+        if (entry.type === "custom" && entry.customType === "sandbox-session") {
+          const data = entry.data as {
+            sessionAllowedDomains?: string[];
+            sessionAllowedReadPaths?: string[];
+            sessionAllowedWritePaths?: string[];
+            sessionUnsandboxedCommands?: string[];
+          };
+          if (data.sessionAllowedDomains) {
+            sessionAllowedDomains.length = 0;
+            sessionAllowedDomains.push(...data.sessionAllowedDomains);
+          }
+          if (data.sessionAllowedReadPaths) {
+            sessionAllowedReadPaths.length = 0;
+            sessionAllowedReadPaths.push(...data.sessionAllowedReadPaths);
+          }
+          if (data.sessionAllowedWritePaths) {
+            sessionAllowedWritePaths.length = 0;
+            sessionAllowedWritePaths.push(...data.sessionAllowedWritePaths);
+          }
+          if (data.sessionUnsandboxedCommands) {
+            sessionUnsandboxedCommands.length = 0;
+            sessionUnsandboxedCommands.push(...data.sessionUnsandboxedCommands);
+          }
+        }
+      }
+    } catch {
+      // Silently ignore restoration errors — sandbox init proceeds without session state
+    }
+  }
+
+  async function persistSessionState(): Promise<void> {
+    if (
+      sessionAllowedDomains.length > 0 ||
+      sessionAllowedReadPaths.length > 0 ||
+      sessionAllowedWritePaths.length > 0 ||
+      sessionUnsandboxedCommands.length > 0
+    ) {
+      try {
+        await pi.appendEntry("sandbox-session", {
+          sessionAllowedDomains: [...sessionAllowedDomains],
+          sessionAllowedReadPaths: [...sessionAllowedReadPaths],
+          sessionAllowedWritePaths: [...sessionAllowedWritePaths],
+          sessionUnsandboxedCommands: [...sessionUnsandboxedCommands],
+        });
+      } catch {
+        // If saving fails, don't clear — allowances survive the current session
+      }
+    }
+    sessionAllowedDomains.length = 0;
+    sessionAllowedReadPaths.length = 0;
+    sessionAllowedWritePaths.length = 0;
+    sessionUnsandboxedCommands.length = 0;
+  }
+
+  // ── session_start — restore persisted state, then init sandbox ────────────
 
   pi.on("session_start", async (_event, ctx) => {
+    await restoreSessionState(ctx);
+
     const noSandbox = pi.getFlag("no-sandbox") as boolean;
 
     if (noSandbox) {
@@ -729,14 +1544,17 @@ export default function (pi: ExtensionAPI) {
         allowBrowserProcess?: boolean;
       };
 
-      await SandboxManager.initialize({
-        network: config.network,
-        filesystem: config.filesystem,
-        ignoreViolations: configExt.ignoreViolations,
-        enableWeakerNestedSandbox: configExt.enableWeakerNestedSandbox,
-        allowBrowserProcess: configExt.allowBrowserProcess,
-        enableWeakerNetworkIsolation: true,
-      });
+      await SandboxManager.initialize(
+        {
+          network: config.network,
+          filesystem: config.filesystem,
+          ignoreViolations: configExt.ignoreViolations,
+          enableWeakerNestedSandbox: configExt.enableWeakerNestedSandbox,
+          allowBrowserProcess: configExt.allowBrowserProcess,
+          enableWeakerNetworkIsolation: true,
+        },
+        createNetworkAskCallback(config.network?.allowedDomains ?? []),
+      );
 
       // Make Node's built-in fetch() honour HTTP_PROXY / HTTPS_PROXY in this
       // process and any child processes that inherit the environment.
@@ -752,11 +1570,15 @@ export default function (pi: ExtensionAPI) {
       sandboxEnabled = true;
       sandboxInitialized = true;
 
-      const networkCount = config.network?.allowedDomains?.length ?? 0;
+      warnIfAllDomainsAllowed(ctx, config);
+
+      const networkLabel = allowsAllDomains(config.network?.allowedDomains)
+        ? "all domains"
+        : `${config.network?.allowedDomains?.length ?? 0} domains`;
       const writeCount = config.filesystem?.allowWrite?.length ?? 0;
       ctx.ui.setStatus(
         "sandbox",
-        ctx.ui.theme.fg("accent", `🔒 Sandbox: ${networkCount} domains, ${writeCount} write paths`),
+        ctx.ui.theme.fg("accent", `🔒 Sandbox: ${networkLabel}, ${writeCount} write paths`),
       );
     } catch (err) {
       sandboxEnabled = false;
@@ -767,9 +1589,10 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  // ── session_shutdown ────────────────────────────────────────────────────────
+  // ── session_shutdown — persist + cleanup ────────────────────────────────────
 
   pi.on("session_shutdown", async () => {
+    await persistSessionState();
     if (sandboxInitialized) {
       try {
         await SandboxManager.reset();
@@ -803,26 +1626,30 @@ export default function (pi: ExtensionAPI) {
           allowBrowserProcess?: boolean;
         };
 
-        await SandboxManager.initialize({
-          network: config.network,
-          filesystem: config.filesystem,
-          ignoreViolations: configExt.ignoreViolations,
-          enableWeakerNestedSandbox: configExt.enableWeakerNestedSandbox,
-          allowBrowserProcess: configExt.allowBrowserProcess,
-          enableWeakerNetworkIsolation: true,
-        });
+        await SandboxManager.initialize(
+          {
+            network: config.network,
+            filesystem: config.filesystem,
+            ignoreViolations: configExt.ignoreViolations,
+            enableWeakerNestedSandbox: configExt.enableWeakerNestedSandbox,
+            allowBrowserProcess: configExt.allowBrowserProcess,
+            enableWeakerNetworkIsolation: true,
+          },
+          createNetworkAskCallback(config.network?.allowedDomains ?? []),
+        );
 
         sandboxEnabled = true;
         sandboxInitialized = true;
 
-        const networkCount = config.network?.allowedDomains?.length ?? 0;
+        warnIfAllDomainsAllowed(ctx, config);
+
+        const networkLabel = allowsAllDomains(config.network?.allowedDomains)
+          ? "all domains"
+          : `${config.network?.allowedDomains?.length ?? 0} domains`;
         const writeCount = config.filesystem?.allowWrite?.length ?? 0;
         ctx.ui.setStatus(
           "sandbox",
-          ctx.ui.theme.fg(
-            "accent",
-            `🔒 Sandbox: ${networkCount} domains, ${writeCount} write paths`,
-          ),
+          ctx.ui.theme.fg("accent", `🔒 Sandbox: ${networkLabel}, ${writeCount} write paths`),
         );
         ctx.ui.notify("Sandbox enabled", "info");
       } catch (err) {
@@ -850,6 +1677,10 @@ export default function (pi: ExtensionAPI) {
         }
       }
 
+      sessionAllowedDomains.length = 0;
+      sessionAllowedReadPaths.length = 0;
+      sessionAllowedWritePaths.length = 0;
+      sessionUnsandboxedCommands.length = 0;
       sandboxEnabled = false;
       sandboxInitialized = false;
       ctx.ui.setStatus("sandbox", "");
@@ -875,6 +1706,9 @@ export default function (pi: ExtensionAPI) {
         "",
         "Network (bash + !cmd):",
         `  Allowed domains: ${config.network?.allowedDomains?.join(", ") || "(none)"}`,
+        ...(allowsAllDomains(config.network?.allowedDomains)
+          ? ['  ⚠️ "*" allows all domains and disables per-domain prompts.']
+          : []),
         `  Denied domains:  ${config.network?.deniedDomains?.join(", ") || "(none)"}`,
         ...(sessionAllowedDomains.length > 0
           ? [`  Session allowed: ${sessionAllowedDomains.join(", ")}`]
@@ -891,11 +1725,57 @@ export default function (pi: ExtensionAPI) {
         ...(sessionAllowedWritePaths.length > 0
           ? [`  Session write: ${sessionAllowedWritePaths.join(", ")}`]
           : []),
+        ...(sessionUnsandboxedCommands.length > 0
+          ? [`  Session unsandboxed: ${sessionUnsandboxedCommands.join(", ")}`]
+          : []),
+        `  Unsandboxed:   ${config.unsandboxedCommands?.join(", ") || "(none)"}`,
+        `  Failure patterns: ${(config.sandboxFailurePatterns ?? DEFAULT_FAILURE_PATTERNS).join(", ")}`,
+
         "",
         "Note: ALL reads are prompted unless the path is already in allowRead.",
         "Note: denyRead is not a hard-block — granting a prompt adds to allowRead, overriding denyRead.",
         "Note: denyWrite takes PRECEDENCE over allowWrite and is never prompted.",
+        "Note: Reactive bypass detects sandbox/auth failures in output. Add custom patterns via sandboxFailurePatterns config.",
       ];
+      ctx.ui.notify(lines.join("\n"), "info");
+    },
+  });
+
+  pi.registerCommand("sandbox-debug", {
+    description:
+      "Debug sandbox config loading. Use when confused about permissions, " +
+      "why a path/domain is blocked, or why an action is denied without apparent reason.",
+    handler: async (_args, ctx) => {
+      const config = loadConfig(ctx.cwd);
+      const { globalPath, projectPath } = getConfigPaths(ctx.cwd);
+
+      const lines = [
+        "Sandbox Debug",
+        `  cwd: ${ctx.cwd}`,
+        `  projectPath: ${projectPath}`,
+        `  globalPath: ${globalPath}`,
+        `  project exists: ${existsSync(projectPath)}`,
+        `  global exists: ${existsSync(globalPath)}`,
+        "",
+        "Loaded config:",
+        `  enabled: ${config.enabled}`,
+        `  unsandboxedCommands: ${JSON.stringify(config.unsandboxedCommands)}`,
+        `  sandboxFailurePatterns: ${JSON.stringify(config.sandboxFailurePatterns)}`,
+        "",
+        "Session state:",
+        `  sessionUnsandboxedCommands: ${JSON.stringify(sessionUnsandboxedCommands)}`,
+        "",
+        "Test match:",
+      ];
+
+      const testCmd = 'security find-generic-password -s "test" 2>&1 | head -3';
+      const normalized = normalizeCmd(testCmd);
+      const patterns = getEffectiveUnsandboxedCommands(ctx.cwd);
+      lines.push(`  test command: ${testCmd}`);
+      lines.push(`  normalized: ${normalized}`);
+      lines.push(`  patterns: ${JSON.stringify(patterns)}`);
+      lines.push(`  match: ${commandIsUnsandboxed(testCmd, patterns)}`);
+
       ctx.ui.notify(lines.join("\n"), "info");
     },
   });
